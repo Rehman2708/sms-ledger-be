@@ -24,30 +24,77 @@ export async function uploadSms(req: AuthedRequest, res: Response): Promise<void
   let duplicates = 0;
   let parsedCount = 0;
   let mergedCount = 0;
+  let failed = 0;
 
-  for (const msg of messages) {
-    const hash = crypto
+  const hashes = messages.map((msg) =>
+    crypto
       .createHash('sha256')
       .update(`${req.userId}:${msg.sender}:${msg.body}:${msg.receivedAt}`)
-      .digest('hex');
+      .digest('hex')
+  );
 
-    const existing = await RawSms.findOne({ hash });
-    if (existing) {
+  // One query for the whole batch instead of one per message — the
+  // dominant cost on a large first-ever sync, since it runs for every
+  // message regardless of whether it later turns out to be a transaction.
+  const existingHashes = new Set(
+    (await RawSms.find({ hash: { $in: hashes } }, { hash: 1 }).lean()).map((d) => d.hash)
+  );
+
+  // The raw-storage step has no cross-message dependency, so it's the one
+  // part of this loop safe to do as a single bulk write instead of one
+  // round-trip per message — the dominant cost for a large batch. The
+  // parse/merge step below stays sequential: it must see Transactions
+  // created earlier in this same batch to merge correctly (e.g. a bank
+  // alert + UPI app confirmation landing in the same sync).
+  const newEntries: Array<{ msg: IncomingSms; hash: string }> = [];
+  for (let idx = 0; idx < messages.length; idx += 1) {
+    const hash = hashes[idx];
+    if (existingHashes.has(hash)) {
       duplicates += 1;
       continue;
     }
+    // Two messages in the same batch can share a hash (e.g. an identical
+    // promo/OTP SMS repeated) — the upfront query above can't see that.
+    existingHashes.add(hash);
+    newEntries.push({ msg: messages[idx], hash });
+  }
 
-    const rawSms = await RawSms.create({
-      user: req.userId,
-      sender: msg.sender,
-      body: msg.body,
-      receivedAt: new Date(msg.receivedAt),
-      hash,
-    });
-    stored += 1;
+  let createdDocs: Array<InstanceType<typeof RawSms>> = [];
+  if (newEntries.length > 0) {
+    try {
+      createdDocs = await RawSms.insertMany(
+        newEntries.map(({ msg, hash }) => ({
+          user: req.userId,
+          sender: msg.sender,
+          body: msg.body,
+          receivedAt: new Date(msg.receivedAt),
+          hash,
+        })),
+        { ordered: false }
+      );
+    } catch (err) {
+      // ordered:false keeps inserting past individual failures (e.g. a rare
+      // duplicate-hash race) — the driver reports those via insertedDocs.
+      const bulkErr = err as { insertedDocs?: Array<InstanceType<typeof RawSms>> };
+      createdDocs = bulkErr.insertedDocs ?? [];
+      failed += newEntries.length - createdDocs.length;
+      console.error('Some SMS in upload batch failed to store', {
+        attempted: newEntries.length,
+        stored: createdDocs.length,
+        error: err instanceof Error ? err.message : err,
+      });
+    }
+  }
+  stored += createdDocs.length;
 
-    const parsed = parseSms(msg.body, msg.sender);
-    if (parsed) {
+  for (const rawSms of createdDocs) {
+    // Isolate each message: a transient DB hiccup or a single malformed SMS
+    // must not crash the rest of a large batch (a first-ever sync can carry
+    // thousands of messages in one request) — log it, count it, keep going.
+    try {
+      const parsed = parseSms(rawSms.body, rawSms.sender);
+      if (!parsed) continue;
+
       const mergeCandidate = await findMergeCandidate(req.userId!, parsed, rawSms.receivedAt);
 
       if (mergeCandidate) {
@@ -81,8 +128,15 @@ export async function uploadSms(req: AuthedRequest, res: Response): Promise<void
       rawSms.parsed = true;
       await rawSms.save();
       parsedCount += 1;
+    } catch (err) {
+      failed += 1;
+      console.error('Failed to parse/merge one SMS in upload batch', {
+        sender: rawSms.sender,
+        receivedAt: rawSms.receivedAt,
+        error: err instanceof Error ? err.message : err,
+      });
     }
   }
 
-  res.status(201).json({ stored, duplicates, parsed: parsedCount, merged: mergedCount });
+  res.status(201).json({ stored, duplicates, parsed: parsedCount, merged: mergedCount, failed });
 }
