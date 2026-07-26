@@ -89,6 +89,14 @@ const PENDING_MANDATE_PATTERN =
 const PENDING_SETTLEMENT_PATTERN =
   /\b(?:is\s+being\s+processed|will\s+(?:reflect|get\s+credited|be\s+credited)\s+in\s+\d|refund\b[^.]{0,40}\binitiated\b)\b/i;
 
+// Card/account statement notices ("Statement is sent to you@gmail.com",
+// "e-Statement generated") report a billing summary, not a completed
+// transaction — the "Total of Rs X" figure is the outstanding balance across
+// the whole cycle, not a single movement. Without this, the bare "sent" in
+// "Statement is sent to ..." matches DEBIT_KEYWORDS below and the cycle total
+// becomes a phantom debit transaction.
+const STATEMENT_PATTERN = /\bstatement\s+(?:is\s+)?(?:sent|generated|dispatched)\b/i;
+
 // Promo/marketing SMS routinely mention a real bank name and can coincidentally
 // contain a debit/credit keyword + amount (e.g. "Get Rs.5000 cashback credited
 // instantly, apply now"). Reject these outright before any amount/bank parsing
@@ -122,8 +130,11 @@ function isSpam(body: string): boolean {
 const BANK_ACCOUNT_REF_PATTERN = /(?:a\/?c|acct|account)\.?\s*(?:no\.?)?\s*[xX*]{1,}(\d{3,6})/i;
 const CARD_REF_PATTERN = /card\.?\s*(?:no\.?)?\s*[xX*]{1,}(\d{3,6})/i;
 
+// "Avl Lmt" is ICICI's own abbreviation for "Available Limit" — without the
+// `lmt` alternative here, those SMS fall through to the matchedVia==='card'
+// default of debit_card and mislabel a real credit-card purchase.
 const CREDIT_CARD_HINTS =
-  /\bcredit\s*card\b|\b(?:credit\s*limit|available\s*limit|avl\s*limit|minimum\s*(?:amount|payment)\s*due|total\s*(?:amount\s*)?due|statement\s*(?:generated|date)|outstanding\s*balance)\b/i;
+  /\bcredit\s*card\b|\b(?:credit\s*limit|available\s*limit|avl\s*lim(?:it|t)|minimum\s*(?:amount|payment)\s*due|total\s*(?:amount\s*)?due|statement\s*(?:generated|date)|outstanding\s*balance)\b/i;
 const DEBIT_CARD_HINTS = /\bdebit\s*card\b/i;
 
 function detectAccountType(
@@ -196,18 +207,26 @@ const MERCHANT_NOISE_PREFIX =
 const CURRENCY_ONLY_PATTERN = /^(?:rs\.?|inr)?\s*[\d,]+(?:\.\d+)?$/i;
 const LEADING_NUMBER_PATTERN = /^\d+\s+\w/;
 
-function looksLikeMerchant(candidate: string): boolean {
+function looksLikeMerchant(candidate: string, bank: string | undefined): boolean {
   if (MERCHANT_NOISE_PREFIX.test(candidate)) return false;
   if (CURRENCY_ONLY_PATTERN.test(candidate)) return false;
   if (LEADING_NUMBER_PATTERN.test(candidate)) return false;
   const isEmailLike = /[@.]/.test(candidate);
-  // A bank's own name isn't a merchant — this catches captures like "ICICI
-  // Bank Credit Card XX0007" off a card/limit alert with no real payee. Skip
-  // this for VPA/email-like candidates: handles routinely embed a bank's
-  // abbreviation in the PSP suffix (ramesh@oksbi, x@okhdfcbank, x@ybl) which
-  // isn't the bank being named as payee, so the check would wrongly blank
-  // out a legitimate UPI counterparty.
-  if (!isEmailLike && BANK_SIGNATURES.some(({ pattern }) => pattern.test(candidate))) return false;
+  // The *issuing* bank's own name isn't a merchant — this catches captures
+  // like "ICICI Bank Credit Card XX0007" off a card/limit alert with no real
+  // payee. Only compare against the bank actually detected for this SMS, not
+  // every known bank signature: several banks double as common merchant
+  // names in card-spend alerts (e.g. "on PAYTM UTILITY" for a Paytm bill
+  // paid via an ICICI card) and would otherwise get wiped out just for
+  // sharing a name with some unrelated bank. Skip this for VPA/email-like
+  // candidates: handles routinely embed a bank's abbreviation in the PSP
+  // suffix (ramesh@oksbi, x@okhdfcbank, x@ybl) which isn't the bank being
+  // named as payee, so the check would wrongly blank out a legitimate UPI
+  // counterparty.
+  if (!isEmailLike && bank) {
+    const issuingBank = BANK_SIGNATURES.find(({ name }) => name === bank);
+    if (issuingBank?.pattern.test(candidate)) return false;
+  }
   // Real merchant names in these SMS are written in caps or title case; a
   // plain lowercase multi-word phrase (that isn't an email/VPA) is almost
   // always leftover sentence filler, not a brand name.
@@ -215,19 +234,66 @@ function looksLikeMerchant(candidate: string): boolean {
   return true;
 }
 
-function extractMerchant(body: string): string | undefined {
+// Fallback brand list, mirrored from mobile/src/assets/brandAssets.ts
+// MERCHANT_LOGOS — when none of the structured "at/to/from X" patterns above
+// capture a merchant (unusual SMS phrasing that doesn't fit those shapes),
+// scan the whole body for a recognizable brand name instead so the
+// transaction still gets a real logo client-side rather than falling back to
+// a plain category glyph. selfBankName marks entries that double as a bank's
+// own name (Paytm/Jio also issue payment-bank accounts) — skipped when that
+// bank is the one issuing this very SMS, since that's a self-reference
+// ("your Jio Payments Bank a/c"), not a merchant.
+const KNOWN_BRAND_PATTERNS: Array<{ pattern: RegExp; selfBankName?: string }> = [
+  { pattern: /flipkart\s*minutes/i },
+  { pattern: /flipkart/i },
+  { pattern: /swiggy/i },
+  { pattern: /zomato/i },
+  { pattern: /blinkit/i },
+  { pattern: /instamart/i },
+  { pattern: /zepto/i },
+  { pattern: /amazon/i },
+  { pattern: /meesho/i },
+  { pattern: /\buber\b/i },
+  { pattern: /\bola\b|olacabs/i },
+  { pattern: /rapido/i },
+  { pattern: /irctc/i },
+  { pattern: /netflix/i },
+  { pattern: /\bboat\b/i },
+  { pattern: /district/i },
+  { pattern: /burger\s*king/i },
+  { pattern: /\btoing\b/i },
+  { pattern: /jio\s*mart/i },
+  { pattern: /myntra/i },
+  { pattern: /big\s*basket/i },
+  { pattern: /domino'?s?/i },
+  { pattern: /jio\s*pay/i, selfBankName: 'Jio Payments Bank' },
+  { pattern: /google\s*pay|\bgpay\b/i },
+  { pattern: /phonepe/i },
+  { pattern: /paytm|one\s?97\s?communications/i, selfBankName: 'Paytm Payments Bank' },
+];
+
+function extractKnownBrand(body: string, bank: string | undefined): string | undefined {
+  for (const { pattern, selfBankName } of KNOWN_BRAND_PATTERNS) {
+    if (selfBankName && selfBankName === bank) continue;
+    const match = body.match(pattern);
+    if (match) return match[0].trim();
+  }
+  return undefined;
+}
+
+function extractMerchant(body: string, bank: string | undefined): string | undefined {
   for (const pattern of GLOBAL_MERCHANT_PATTERNS) {
     for (const match of body.matchAll(pattern)) {
       const merchant = match[1]?.trim();
       if (!merchant || /^\d+$/.test(merchant)) continue;
-      if (!looksLikeMerchant(merchant)) continue;
+      if (!looksLikeMerchant(merchant, bank)) continue;
       // The "from"/"to" patterns can capture the leading "VPA " protocol
       // label along with the actual counterparty handle (e.g. "from VPA
       // ramesh@oksbi") — that label isn't part of the payee's identity.
       return merchant.replace(/^vpa\s+/i, '');
     }
   }
-  return undefined;
+  return extractKnownBrand(body, bank);
 }
 
 export function parseSms(body: string, sender?: string): ParsedSms | null {
@@ -235,6 +301,7 @@ export function parseSms(body: string, sender?: string): ParsedSms | null {
   if (OTP_PATTERN.test(body)) return null;
   if (PENDING_MANDATE_PATTERN.test(body)) return null;
   if (PENDING_SETTLEMENT_PATTERN.test(body)) return null;
+  if (STATEMENT_PATTERN.test(body)) return null;
 
   const amountMatch = body.match(AMOUNT_PATTERN);
   if (!amountMatch) return null;
@@ -266,7 +333,7 @@ export function parseSms(body: string, sender?: string): ParsedSms | null {
   // unparseable instead of fabricating a transaction with no source.
   if (!bank && !accountLast4) return null;
 
-  const merchant = extractMerchant(body);
+  const merchant = extractMerchant(body, bank);
   const accountType = detectAccountType(body, bank, matchedVia);
 
   return { amount, type, merchant, bank, accountLast4, accountType };

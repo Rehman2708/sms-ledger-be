@@ -12,6 +12,10 @@
 //     different SMS templates mask a different number of digits
 //   - fill in/correct merchant (and re-derive category/kind from it) now that
 //     VPA handles no longer get blanked out by a coincidental bank-name match
+//   - correct debit/credit type on transactions parsed under an older
+//     CREDIT_KEYWORDS regex that could match "Credit Card" itself (fixed by
+//     the (?!\s*card) lookahead) and got stored as a credit despite the body
+//     only ever saying "debited"
 //
 // Run with: npm run backfill:spam-cleanup
 import mongoose from 'mongoose';
@@ -29,6 +33,7 @@ async function run(): Promise<void> {
   let accountTypeCorrected = 0;
   let merchantCorrected = 0;
   let accountLast4Corrected = 0;
+  let typeCorrected = 0;
   let scanned = 0;
 
   const cursor = Transaction.find({ rawSms: { $ne: null } }).cursor();
@@ -54,6 +59,12 @@ async function run(): Promise<void> {
     }
 
     let changed = false;
+
+    if (reparsed.type !== tx.type) {
+      tx.type = reparsed.type;
+      changed = true;
+      typeCorrected += 1;
+    }
 
     if ((reparsed.bank ?? null) !== (tx.bank ?? null)) {
       tx.bank = reparsed.bank ?? undefined;
@@ -91,6 +102,7 @@ async function run(): Promise<void> {
 
   console.log(`Scanned ${scanned} transactions.`);
   console.log(`Deleted ${deleted} spam-derived transactions.`);
+  console.log(`Corrected type on ${typeCorrected} transactions.`);
   console.log(`Corrected bank on ${bankCorrected} transactions.`);
   console.log(`Corrected accountType on ${accountTypeCorrected} transactions.`);
   console.log(`Corrected accountLast4 on ${accountLast4Corrected} transactions.`);

@@ -239,22 +239,34 @@ export async function uploadSms(req: AuthedRequest, res: Response): Promise<void
           accountType: parsed.accountType,
           transactionDate: rawSms.receivedAt,
         });
-        rawSmsUpdates.push({
-          updateOne: { filter: { _id: rawSms._id }, update: { $set: { parsed: true } } },
-        });
       }
       parsedCount += 1;
     }
 
     // Flush in as few round-trips as possible instead of one write (or
-    // three) per parsed message.
+    // three) per parsed message. rawSmsUpdates for the toCreate path is
+    // built from whatever insertMany actually persisted, not from toCreate
+    // itself — a RawSms must never be marked parsed:true when its
+    // Transaction failed to save, or the money silently disappears with no
+    // way to recover it (the raw SMS looks "handled" forever).
     if (toCreate.length > 0) {
+      let insertedIds = new Set<string>(toCreate.map((doc) => String(doc._id)));
       try {
         await Transaction.insertMany(toCreate, { ordered: false });
       } catch (err) {
+        const bulkErr = err as { insertedDocs?: Array<{ _id: unknown }> };
+        insertedIds = new Set((bulkErr.insertedDocs ?? []).map((d) => String(d._id)));
+        failed += toCreate.length - insertedIds.size;
         console.error('Some new transactions in upload batch failed to save', {
           attempted: toCreate.length,
+          stored: insertedIds.size,
           error: err instanceof Error ? err.message : err,
+        });
+      }
+      for (const doc of toCreate) {
+        if (!insertedIds.has(String(doc._id))) continue;
+        rawSmsUpdates.push({
+          updateOne: { filter: { _id: doc.rawSms }, update: { $set: { parsed: true } } },
         });
       }
     }

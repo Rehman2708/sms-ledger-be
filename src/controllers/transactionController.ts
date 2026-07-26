@@ -26,12 +26,16 @@ export async function listTransactions(req: AuthedRequest, res: Response): Promi
   const { kind, category, from, to, cursor, limit } = req.query;
 
   const filter: Record<string, unknown> = { user: req.userId };
-  if (kind) filter.kind = kind;
-  if (category) filter.category = category;
+  // typeof-guarded even though express 5's default 'simple' query parser
+  // can't produce nested objects from bracket notation — cheap
+  // defense-in-depth against a future parser config change turning these
+  // into Mongo operator injection (e.g. ?kind[$ne]=x).
+  if (typeof kind === 'string' && kind) filter.kind = kind;
+  if (typeof category === 'string' && category) filter.category = category;
   if (from || to) {
     filter.transactionDate = {
-      ...(from ? { $gte: new Date(String(from)) } : {}),
-      ...(to ? { $lte: new Date(String(to)) } : {}),
+      ...(typeof from === 'string' && from ? { $gte: new Date(from) } : {}),
+      ...(typeof to === 'string' && to ? { $lte: new Date(to) } : {}),
     };
   }
 
@@ -45,8 +49,13 @@ export async function listTransactions(req: AuthedRequest, res: Response): Promi
 
   // No `limit` param → preserve the original unpaginated behavior for
   // callers that need the complete set (dashboard/profile totals, account
-  // breakdowns). Pagination is opt-in via `limit`.
-  const pageSize = limit ? Math.min(Number(limit) || DEFAULT_LIMIT, MAX_LIMIT) : undefined;
+  // breakdowns). Pagination is opt-in via `limit`. A non-positive or
+  // non-numeric value falls back to the default instead of reaching
+  // Mongoose's .limit() with 0/negative, which throws.
+  const requestedLimit = Number(limit);
+  const pageSize = limit
+    ? Math.min(Number.isFinite(requestedLimit) && requestedLimit > 0 ? requestedLimit : DEFAULT_LIMIT, MAX_LIMIT)
+    : undefined;
 
   let query = Transaction.find(filter).sort({ transactionDate: -1, _id: -1 });
   if (pageSize) query = query.limit(pageSize + 1);

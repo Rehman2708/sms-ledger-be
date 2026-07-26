@@ -8,9 +8,9 @@ export async function listAccountNicknames(req: AuthedRequest, res: Response): P
 }
 
 export async function upsertAccountNickname(req: AuthedRequest, res: Response): Promise<void> {
-  const { bank, accountLast4, nickname } = req.body ?? {};
+  const { bank: rawBank, accountLast4, nickname } = req.body ?? {};
 
-  if (typeof bank !== 'string' || !bank.trim()) {
+  if (typeof rawBank !== 'string' || !rawBank.trim()) {
     res.status(400).json({ message: 'bank is required' });
     return;
   }
@@ -18,6 +18,9 @@ export async function upsertAccountNickname(req: AuthedRequest, res: Response): 
     res.status(400).json({ message: 'nickname is required' });
     return;
   }
+  // Untrimmed bank strings ("HDFC" vs "HDFC ") would otherwise pass the
+  // compound unique index as distinct docs for what's really the same bank.
+  const bank = rawBank.trim();
 
   const filter = {
     user: req.userId,

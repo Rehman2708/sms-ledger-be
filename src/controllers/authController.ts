@@ -33,7 +33,21 @@ export async function register(req: Request, res: Response): Promise<void> {
     return;
   }
 
-  const user = await registerUser(email, password, name);
+  // The findOne check above isn't atomic with the create below — two
+  // concurrent registrations for the same email can both pass it. The
+  // unique index on User.email is the real guard; catch its duplicate-key
+  // error here so the loser gets a clean 409 instead of falling through to
+  // the generic error handler as a 500.
+  let user;
+  try {
+    user = await registerUser(email, password, name);
+  } catch (err) {
+    if (err instanceof Error && (err as { code?: number }).code === 11000) {
+      res.status(409).json({ message: 'User already exists' });
+      return;
+    }
+    throw err;
+  }
   const token = signToken(user.id);
   res.status(201).json({ token, user: { id: user.id, email: user.email, name: user.name } });
 }
