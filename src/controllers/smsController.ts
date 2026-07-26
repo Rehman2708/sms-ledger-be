@@ -1,16 +1,38 @@
 import type { Response } from 'express';
 import crypto from 'node:crypto';
+import mongoose from 'mongoose';
 import type { AuthedRequest } from '../middleware/auth';
 import RawSms from '../models/RawSms';
 import Transaction from '../models/Transaction';
 import { classifyMerchant } from '../services/merchantClassifier';
-import { parseSms } from '../services/smsParser';
-import { findMergeCandidate } from '../services/transactionMatcher';
+import { parseSms, type ParsedSms } from '../services/smsParser';
+import { pickMergeCandidate, MATCH_WINDOW_MS, type MergeCandidate } from '../services/transactionMatcher';
 
 interface IncomingSms {
   sender: string;
   body: string;
   receivedAt: string;
+}
+
+// The in-memory merge-candidate pool for one upload batch: existing
+// Transactions fetched once up front, plus any new one created earlier in
+// this same batch (appended as we go) so later messages can still merge
+// against it without a DB round-trip.
+interface PoolEntry extends MergeCandidate {
+  merchant?: string;
+  accountLast4?: string;
+  accountType?: string;
+  relatedRawSms: mongoose.Types.ObjectId[];
+  sourceCount: number;
+}
+
+// Lets the client recover its resume point whenever local state is lost
+// (reinstall, logout/login, new device, cleared storage) instead of falling
+// back to re-reading and re-uploading the entire on-device SMS backlog —
+// the server already knows the true high-water mark for this user.
+export async function getSyncCursor(req: AuthedRequest, res: Response): Promise<void> {
+  const latest = await RawSms.findOne({ user: req.userId }).sort({ receivedAt: -1 }).select('receivedAt').lean();
+  res.json({ lastSyncedAt: latest ? latest.receivedAt.getTime() : null });
 }
 
 export async function uploadSms(req: AuthedRequest, res: Response): Promise<void> {
@@ -26,29 +48,45 @@ export async function uploadSms(req: AuthedRequest, res: Response): Promise<void
   let mergedCount = 0;
   let failed = 0;
 
-  const hashes = messages.map((msg) =>
-    crypto
+  // A malformed item (missing sender/body, or a receivedAt that doesn't
+  // parse to a real date) can't just be hashed-and-stored like the rest: an
+  // invalid receivedAt becomes an Invalid Date whose getTime() is NaN, and
+  // one NaN in the batch's since/until window computation below (a Math.min
+  // /max over every parsed message's timestamp) poisons the *entire* batch's
+  // merge-candidate prefetch — not just the one bad message. Filter these
+  // out up front instead of letting them reach that shared computation.
+  const validMessages: Array<{ msg: IncomingSms; hash: string }> = [];
+  for (const msg of messages) {
+    const sender = typeof msg?.sender === 'string' ? msg.sender.trim() : '';
+    const body = typeof msg?.body === 'string' ? msg.body.trim() : '';
+    const receivedAtMs = new Date(msg?.receivedAt).getTime();
+    if (!sender || !body || !Number.isFinite(receivedAtMs)) {
+      failed += 1;
+      continue;
+    }
+    const hash = crypto
       .createHash('sha256')
       .update(`${req.userId}:${msg.sender}:${msg.body}:${msg.receivedAt}`)
-      .digest('hex')
-  );
+      .digest('hex');
+    validMessages.push({ msg, hash });
+  }
 
   // One query for the whole batch instead of one per message — the
   // dominant cost on a large first-ever sync, since it runs for every
   // message regardless of whether it later turns out to be a transaction.
   const existingHashes = new Set(
-    (await RawSms.find({ hash: { $in: hashes } }, { hash: 1 }).lean()).map((d) => d.hash)
+    validMessages.length > 0
+      ? (
+          await RawSms.find({ hash: { $in: validMessages.map((v) => v.hash) } }, { hash: 1 }).lean()
+        ).map((d) => d.hash)
+      : []
   );
 
   // The raw-storage step has no cross-message dependency, so it's the one
   // part of this loop safe to do as a single bulk write instead of one
-  // round-trip per message — the dominant cost for a large batch. The
-  // parse/merge step below stays sequential: it must see Transactions
-  // created earlier in this same batch to merge correctly (e.g. a bank
-  // alert + UPI app confirmation landing in the same sync).
+  // round-trip per message.
   const newEntries: Array<{ msg: IncomingSms; hash: string }> = [];
-  for (let idx = 0; idx < messages.length; idx += 1) {
-    const hash = hashes[idx];
+  for (const { msg, hash } of validMessages) {
     if (existingHashes.has(hash)) {
       duplicates += 1;
       continue;
@@ -56,7 +94,7 @@ export async function uploadSms(req: AuthedRequest, res: Response): Promise<void
     // Two messages in the same batch can share a hash (e.g. an identical
     // promo/OTP SMS repeated) — the upfront query above can't see that.
     existingHashes.add(hash);
-    newEntries.push({ msg: messages[idx], hash });
+    newEntries.push({ msg, hash });
   }
 
   let createdDocs: Array<InstanceType<typeof RawSms>> = [];
@@ -87,33 +125,110 @@ export async function uploadSms(req: AuthedRequest, res: Response): Promise<void
   }
   stored += createdDocs.length;
 
+  // Parsing is pure CPU (no DB), so do it all up front — this tells us
+  // exactly which docs need transaction work before touching the database
+  // again, and isolates a parser bug on one message from the rest.
+  const parsedEntries: Array<{ rawSms: InstanceType<typeof RawSms>; parsed: ParsedSms }> = [];
   for (const rawSms of createdDocs) {
-    // Isolate each message: a transient DB hiccup or a single malformed SMS
-    // must not crash the rest of a large batch (a first-ever sync can carry
-    // thousands of messages in one request) — log it, count it, keep going.
     try {
       const parsed = parseSms(rawSms.body, rawSms.sender);
-      if (!parsed) continue;
+      if (parsed) parsedEntries.push({ rawSms, parsed });
+    } catch (err) {
+      failed += 1;
+      console.error('Failed to parse one SMS in upload batch', {
+        sender: rawSms.sender,
+        receivedAt: rawSms.receivedAt,
+        error: err instanceof Error ? err.message : err,
+      });
+    }
+  }
 
-      const mergeCandidate = await findMergeCandidate(req.userId!, parsed, rawSms.receivedAt);
+  if (parsedEntries.length > 0) {
+    const timestamps = parsedEntries.map((e) => e.rawSms.receivedAt.getTime());
+    const since = new Date(Math.min(...timestamps) - MATCH_WINDOW_MS);
+    const until = new Date(Math.max(...timestamps) + MATCH_WINDOW_MS);
 
-      if (mergeCandidate) {
+    // One prefetch covering the whole batch's merge window instead of one
+    // query per parsed message — the other dominant per-message DB cost.
+    const existing = await Transaction.find({
+      user: req.userId,
+      transactionDate: { $gte: since, $lte: until },
+    }).lean();
+
+    const pool: PoolEntry[] = existing.map((t) => ({
+      _id: t._id,
+      type: t.type,
+      amount: t.amount,
+      transactionDate: t.transactionDate,
+      bank: t.bank ?? undefined,
+      merchant: t.merchant ?? undefined,
+      accountLast4: t.accountLast4 ?? undefined,
+      accountType: t.accountType ?? undefined,
+      relatedRawSms: t.relatedRawSms ?? [],
+      sourceCount: t.sourceCount ?? 1,
+    }));
+
+    const toCreate: Array<Record<string, unknown>> = [];
+    const transactionUpdates: mongoose.AnyBulkWriteOperation[] = [];
+    const rawSmsUpdates: mongoose.AnyBulkWriteOperation[] = [];
+
+    for (const { rawSms, parsed } of parsedEntries) {
+      const candidate = pickMergeCandidate(pool, parsed, rawSms.receivedAt);
+
+      if (candidate) {
         // Same payment reported by a second SMS (e.g. bank alert + UPI app
         // confirmation) — link it instead of double-counting the spend.
-        mergeCandidate.relatedRawSms = [...mergeCandidate.relatedRawSms, rawSms._id];
-        mergeCandidate.sourceCount = (mergeCandidate.sourceCount ?? 1) + 1;
-        mergeCandidate.bank = mergeCandidate.bank ?? parsed.bank;
-        mergeCandidate.merchant = mergeCandidate.merchant ?? parsed.merchant;
-        mergeCandidate.accountLast4 = mergeCandidate.accountLast4 ?? parsed.accountLast4;
-        await mergeCandidate.save();
+        candidate.relatedRawSms = [...candidate.relatedRawSms, rawSms._id];
+        candidate.sourceCount += 1;
+        candidate.bank = candidate.bank ?? parsed.bank;
+        candidate.merchant = candidate.merchant ?? parsed.merchant;
+        candidate.accountLast4 = candidate.accountLast4 ?? parsed.accountLast4;
+        candidate.accountType = candidate.accountType ?? parsed.accountType;
 
-        rawSms.duplicateOfTransaction = mergeCandidate._id;
+        transactionUpdates.push({
+          updateOne: {
+            filter: { _id: candidate._id },
+            update: {
+              $set: {
+                relatedRawSms: candidate.relatedRawSms,
+                sourceCount: candidate.sourceCount,
+                bank: candidate.bank,
+                merchant: candidate.merchant,
+                accountLast4: candidate.accountLast4,
+                accountType: candidate.accountType,
+              },
+            },
+          },
+        });
+        rawSmsUpdates.push({
+          updateOne: {
+            filter: { _id: rawSms._id },
+            update: { $set: { parsed: true, duplicateOfTransaction: candidate._id } },
+          },
+        });
         mergedCount += 1;
       } else {
         const { category, kind } = classifyMerchant(parsed.merchant);
-        await Transaction.create({
+        const newId = new mongoose.Types.ObjectId();
+        const newEntry: PoolEntry = {
+          _id: newId,
+          type: parsed.type,
+          amount: parsed.amount,
+          transactionDate: rawSms.receivedAt,
+          bank: parsed.bank,
+          merchant: parsed.merchant,
+          accountLast4: parsed.accountLast4,
+          accountType: parsed.accountType,
+          relatedRawSms: [],
+          sourceCount: 1,
+        };
+        // Visible to subsequent messages in this same batch.
+        pool.push(newEntry);
+
+        toCreate.push({
+          _id: newId,
           user: req.userId,
-          rawSms: rawSms.id,
+          rawSms: rawSms._id,
           amount: parsed.amount,
           type: parsed.type,
           category,
@@ -121,20 +236,47 @@ export async function uploadSms(req: AuthedRequest, res: Response): Promise<void
           merchant: parsed.merchant,
           bank: parsed.bank,
           accountLast4: parsed.accountLast4,
+          accountType: parsed.accountType,
           transactionDate: rawSms.receivedAt,
         });
+        rawSmsUpdates.push({
+          updateOne: { filter: { _id: rawSms._id }, update: { $set: { parsed: true } } },
+        });
       }
-
-      rawSms.parsed = true;
-      await rawSms.save();
       parsedCount += 1;
-    } catch (err) {
-      failed += 1;
-      console.error('Failed to parse/merge one SMS in upload batch', {
-        sender: rawSms.sender,
-        receivedAt: rawSms.receivedAt,
-        error: err instanceof Error ? err.message : err,
-      });
+    }
+
+    // Flush in as few round-trips as possible instead of one write (or
+    // three) per parsed message.
+    if (toCreate.length > 0) {
+      try {
+        await Transaction.insertMany(toCreate, { ordered: false });
+      } catch (err) {
+        console.error('Some new transactions in upload batch failed to save', {
+          attempted: toCreate.length,
+          error: err instanceof Error ? err.message : err,
+        });
+      }
+    }
+    if (transactionUpdates.length > 0) {
+      try {
+        await Transaction.bulkWrite(transactionUpdates, { ordered: false });
+      } catch (err) {
+        console.error('Some merged-transaction updates in upload batch failed', {
+          attempted: transactionUpdates.length,
+          error: err instanceof Error ? err.message : err,
+        });
+      }
+    }
+    if (rawSmsUpdates.length > 0) {
+      try {
+        await RawSms.bulkWrite(rawSmsUpdates, { ordered: false });
+      } catch (err) {
+        console.error('Some raw SMS parsed-flag updates in upload batch failed', {
+          attempted: rawSmsUpdates.length,
+          error: err instanceof Error ? err.message : err,
+        });
+      }
     }
   }
 

@@ -1,4 +1,8 @@
 import type { Request, Response } from 'express';
+import type { AuthedRequest } from '../middleware/auth';
+import AccountNickname from '../models/AccountNickname';
+import RawSms from '../models/RawSms';
+import Transaction from '../models/Transaction';
 import User from '../models/User';
 import { registerUser, signToken, validateCredentials } from '../services/authService';
 import { isValidEmail, passwordStrengthError } from '../utils/validation';
@@ -53,4 +57,19 @@ export async function login(req: Request, res: Response): Promise<void> {
 
   const token = signToken(user.id);
   res.json({ token, user: { id: user.id, email: user.email, name: user.name } });
+}
+
+// Permanently wipes this user and every collection keyed to them — there's
+// no soft-delete/undo here, matching what "delete account" promises the user.
+export async function deleteAccount(req: AuthedRequest, res: Response): Promise<void> {
+  const userId = req.userId;
+
+  await Promise.all([
+    Transaction.deleteMany({ user: userId }),
+    RawSms.deleteMany({ user: userId }),
+    AccountNickname.deleteMany({ user: userId }),
+  ]);
+  await User.findByIdAndDelete(userId);
+
+  res.status(204).send();
 }

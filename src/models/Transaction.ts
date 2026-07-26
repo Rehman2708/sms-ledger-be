@@ -14,6 +14,7 @@ const transactionSchema = new Schema(
     merchant: { type: String },
     bank: { type: String },
     accountLast4: { type: String },
+    accountType: { type: String, enum: ['bank_account', 'credit_card', 'debit_card'] },
     transactionDate: { type: Date, required: true },
     kind: {
       type: String,
@@ -23,6 +24,11 @@ const transactionSchema = new Schema(
   },
   { timestamps: true }
 );
+
+// Backs both the merge-candidate prefetch in smsController (an equality +
+// range scan, direction-agnostic) and the paginated transaction list (a
+// descending sort with an _id tiebreaker for a stable cursor).
+transactionSchema.index({ user: 1, transactionDate: -1, _id: -1 });
 
 export type Transaction = InferSchemaType<typeof transactionSchema>;
 export default model('Transaction', transactionSchema);
