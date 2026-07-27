@@ -61,7 +61,14 @@ const AMOUNT_PATTERN = /(?:rs\.?|inr)\s*([\d,]+(?:\.\d{1,2})?)/i;
 // *instrument* ("Credit Card XX0007", "Debit Card XX1234") rather than
 // describing money movement — otherwise an OTP alert that only mentions
 // "...on ICICI Bank Credit Card XX0007" gets misread as a completed credit
-// transaction (see OTP_PATTERN below for the other half of that fix).
+// transaction (see OTP_PATTERN below for the other half of that fix). Note
+// bare "credit" followed by "limit" (as in "Available Credit limit is INR
+// X") is deliberately left matching — that phrasing shows up as an aside in
+// real reversal/refund alerts ("your transaction ... has been reversed.
+// Available Credit limit is INR X"), where it's the only keyword that
+// identifies the message as a credit event at all. The credit-limit-*change*
+// notification this could be confused with is excluded separately below,
+// by CREDIT_LIMIT_CHANGE_PATTERN, before type detection ever runs.
 const DEBIT_KEYWORDS =
   /\b(debited|spent|paid|purchase(?:d)?|withdrawn|sent)\b|\bdebit\b(?!\s*card)/i;
 const CREDIT_KEYWORDS =
@@ -80,7 +87,20 @@ const OTP_PATTERN = /\botp\b/i;
 // the execution date. Without this, a recurring mandate reminder creates a
 // phantom transaction every cycle before the real debit even happens.
 const PENDING_MANDATE_PATTERN =
-  /\b(?:is\s+scheduled\s+on|will\s+be\s+(?:debited|charged|presented)\s+on|mandate\s+is\s+successfully\s+(?:created|revoked)|approve\s+your\s+automatic\s+payment)\b/i;
+  /\b(?:is\s+scheduled\s+on|will\s+be\s+(?:debited|charged|presented)\s+on|mandate\s+is\s+successfully\s+(?:created|revoked)|approve\s+your\s+automatic\s+payment|pending\s+to\s+approve)\b/i;
+
+// UPI collect/pull-payment requests ("IRCTC has requested money from you on
+// your UPI App. On approving the request, Rs 1500.00 will be debited from
+// your account." / "...has requested money on the Paytm App. On approving,
+// Rs X will be debited..." / "...has requested Rs X frm u on Google Pay app.
+// Once approved, money will be debited frm ur a/c") describe someone asking
+// the user for money, not money that has moved — the user must explicitly
+// approve in their UPI app first, and a real debit alert (if approved) is a
+// separate, later SMS. Every PSP (SBI, Paytm, Google Pay, Kotak, CRED) phrases
+// this differently, so this matches on the shared shape (a request, followed
+// by a conditional "will be debited") rather than one exact wording.
+const PENDING_COLLECT_REQUEST_PATTERN =
+  /\bhas\s+requested\b[\s\S]{0,200}?\b(?:on\s+approving|once\s+approved)\b[\s\S]{0,80}?\bwill\s+be\s+debited\b/i;
 
 // Refund/settlement-in-flight notices ("is being processed", "will reflect
 // in 5-7 business days", "refund ... initiated") describe money that has
@@ -96,6 +116,14 @@ const PENDING_SETTLEMENT_PATTERN =
 // "Statement is sent to ..." matches DEBIT_KEYWORDS below and the cycle total
 // becomes a phantom debit transaction.
 const STATEMENT_PATTERN = /\bstatement\s+(?:is\s+)?(?:sent|generated|dispatched)\b/i;
+
+// Credit-limit-change notices ("The credit limit for your ICICI Bank Credit
+// Card XX0007 has been changed from INR 95000 to INR 120000") aren't a
+// transaction at all — no money moved. Without this, the bare "credit" in
+// "credit limit" satisfies CREDIT_KEYWORDS, and AMOUNT_PATTERN grabs the
+// first "INR <number>" (the *old* limit) as if it were a real credited
+// amount, fabricating a phantom transaction for whatever the old limit was.
+const CREDIT_LIMIT_CHANGE_PATTERN = /\bcredit\s*limit\b[^.]{0,60}\bchanged\s+from\b/i;
 
 // Promo/marketing SMS routinely mention a real bank name and can coincidentally
 // contain a debit/credit keyword + amount (e.g. "Get Rs.5000 cashback credited
@@ -300,8 +328,10 @@ export function parseSms(body: string, sender?: string): ParsedSms | null {
   if (isSpam(body)) return null;
   if (OTP_PATTERN.test(body)) return null;
   if (PENDING_MANDATE_PATTERN.test(body)) return null;
+  if (PENDING_COLLECT_REQUEST_PATTERN.test(body)) return null;
   if (PENDING_SETTLEMENT_PATTERN.test(body)) return null;
   if (STATEMENT_PATTERN.test(body)) return null;
+  if (CREDIT_LIMIT_CHANGE_PATTERN.test(body)) return null;
 
   const amountMatch = body.match(AMOUNT_PATTERN);
   if (!amountMatch) return null;

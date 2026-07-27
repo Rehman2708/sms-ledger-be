@@ -1,5 +1,6 @@
 import type { Request, Response } from 'express';
 import type { AuthedRequest } from '../middleware/auth';
+import AccountMerge from '../models/AccountMerge';
 import AccountNickname from '../models/AccountNickname';
 import RawSms from '../models/RawSms';
 import Transaction from '../models/Transaction';
@@ -82,6 +83,7 @@ export async function deleteAccount(req: AuthedRequest, res: Response): Promise<
     Transaction.deleteMany({ user: userId }),
     RawSms.deleteMany({ user: userId }),
     AccountNickname.deleteMany({ user: userId }),
+    AccountMerge.deleteMany({ user: userId }),
   ]);
   await User.findByIdAndDelete(userId);
 
